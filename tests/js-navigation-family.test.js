@@ -284,6 +284,57 @@ test('clear-site-data supports origin-only fallback and rejects empty type lists
   });
 });
 
+test('settle waits for a quiet period after the tab reaches complete', async () => {
+  const updatedListeners = new Set();
+  const removedListeners = new Set();
+  let tab = { id: 77, url: 'https://s.test', title: 'S', status: 'loading', windowId: 1 };
+  const tabsApi = {
+    async get() { return { ...tab }; },
+    async update(_id, changes) { tab = { ...tab, ...changes, status: 'loading' }; return { ...tab }; },
+    onUpdated: {
+      addListener(fn) { updatedListeners.add(fn); },
+      removeListener(fn) { updatedListeners.delete(fn); },
+    },
+    onRemoved: {
+      addListener(fn) { removedListeners.add(fn); },
+      removeListener(fn) { removedListeners.delete(fn); },
+    },
+  };
+
+  const handlers = createJsNavigationDestructiveHandlers({ tabsApi, resolveDefaultTabId: async () => 77 });
+
+  // Arrange: one `complete` update, then another update 50ms later,
+  // then no updates for 500ms (the default quiet window).
+  const startedAt = Date.now();
+  const navigatePromise = handlers.browser_navigate({ url: 'https://s.test/next', wait_until: 'settle', timeout_ms: 5000 });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  tab = { ...tab, status: 'complete', url: 'https://s.test/next' };
+  for (const fn of updatedListeners) fn(77, { status: 'complete' }, { ...tab });
+  // One more mid-flight update inside the quiet window -> resets timer.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  for (const fn of updatedListeners) fn(77, { status: 'complete' }, { ...tab });
+
+  const result = await navigatePromise;
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed >= 500, `settle should wait at least the quiet window (elapsed=${elapsed}ms)`);
+  assert.equal(result.url, 'https://s.test/next');
+});
+
+test('networkidle is rejected by the default fallback when no custom waiter is provided', async () => {
+  const { tabsApi } = createTabApis();
+  const handlers = createJsNavigationDestructiveHandlers({ tabsApi, resolveDefaultTabId: async () => 11 });
+
+  await assert.rejects(
+    handlers.browser_navigate({ url: 'https://example.com/nid', wait_until: 'networkidle', timeout_ms: 500 }),
+    (error) => {
+      assert.equal(error.code, 'E_VALIDATION');
+      assert.match(error.message, /networkidle/);
+      return true;
+    },
+  );
+});
+
 test('request handler maps unknown requests and normalizes thrown errors', async () => {
   const { tabsApi } = createTabApis();
   const handler = createJsNavigationDestructiveRequestHandler({ tabsApi, resolveDefaultTabId: async () => 11 });

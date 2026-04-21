@@ -10,12 +10,14 @@ function createBufferSpy(name) {
     armed: [],
     persisted: [],
     released: [],
+    removed: [],
     disconnected: [],
     flushed: 0,
     disposed: 0,
     async armTab(tabId) { this.armed.push(tabId); },
     async persistTab(tabId) { this.persisted.push(tabId); return true; },
     async releaseTab(tabId) { this.released.push(tabId); },
+    async removeTab(tabId, options) { this.removed.push([tabId, options]); },
     disconnectTab(tabId, reason) { this.disconnected.push([tabId, reason]); },
     async flushAll() { this.flushed += 1; },
     async dispose() { this.disposed += 1; },
@@ -46,7 +48,11 @@ test('observability lifecycle arms existing tabs and flushes both buffers safely
 
   await lifecycle.handleTabRemoved(2, 'tab_closed');
   assert.deepEqual(consoleBuffer.disconnected, [[2, 'tab_closed']]);
-  assert.deepEqual(networkBuffer.released, [2]);
+  assert.equal(consoleBuffer.removed.length, 1);
+  assert.equal(consoleBuffer.removed[0][0], 2);
+  assert.equal(consoleBuffer.removed[0][1]?.persist, true);
+  assert.equal(networkBuffer.removed.length, 1);
+  assert.equal(networkBuffer.removed[0][0], 2);
 });
 
 test('observability handlers expose browser_get_console_logs and browser_get_network maps', async () => {

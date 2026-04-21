@@ -46,17 +46,17 @@ export function createObservabilityLifecycle({
     async handleSuspend() {
       await Promise.allSettled([
         consoleBuffer.flushAll(),
-        networkBuffer.flushAll(),
+        networkBuffer.flushAll({ finalizeInFlight: true, reason: 'suspend' }),
       ]);
     },
     async handleTabRemoved(tabId, reason = 'tab_removed') {
       consoleBuffer.disconnectTab(tabId, reason);
       networkBuffer.disconnectTab(tabId, reason);
+      // Persist a final snapshot (interrupted in-flight requests get finalized via disconnectTab above),
+      // then evict both the in-memory state and the persisted storage key so closed tabs do not leak.
       await Promise.allSettled([
-        consoleBuffer.persistTab(tabId),
-        networkBuffer.persistTab(tabId),
-        consoleBuffer.releaseTab(tabId),
-        networkBuffer.releaseTab(tabId),
+        consoleBuffer.removeTab(tabId, { persist: true }),
+        networkBuffer.removeTab(tabId, { persist: true }),
       ]);
     },
     handleDisconnect(tabId, reason = 'debugger_disconnected') {

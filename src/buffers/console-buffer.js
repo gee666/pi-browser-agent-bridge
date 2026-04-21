@@ -1,3 +1,5 @@
+import { storageAreaGet, storageAreaRemove, storageAreaSet } from './storage.js';
+
 const DEFAULT_MAX_ENTRIES = 2000;
 const DEFAULT_PERSIST_KEY_PREFIX = 'piBridge.consoleBuf.';
 const DEFAULT_PERSIST_MAX_BYTES = 512 * 1024;
@@ -84,6 +86,7 @@ function createTabState(tabId, persistedEntries = []) {
     disconnectedAt: undefined,
     disconnectReason: undefined,
     lease: null,
+    armGeneration: 0,
   };
 }
 
@@ -150,9 +153,7 @@ export class ConsoleBufferManager {
       return state;
     }
     try {
-      const stored = await new Promise((resolve) => {
-        this._storageArea.get([this._storageKey(tabId)], (result) => resolve(result || {}));
-      });
+      const stored = await storageAreaGet(this._storageArea, [this._storageKey(tabId)]);
       const payload = stored?.[this._storageKey(tabId)] || {};
       state.entries = safeArray(payload.entries).slice(-this._maxEntries);
       state.bytes = safeJsonSize(state.entries);
@@ -180,13 +181,22 @@ export class ConsoleBufferManager {
         disconnectedAt: state.disconnectedAt,
         disconnectReason: state.disconnectReason,
       };
-      await new Promise((resolve) => {
-        this._storageArea.set({ [this._storageKey(tabId)]: payload }, () => resolve());
-      });
+      await storageAreaSet(this._storageArea, { [this._storageKey(tabId)]: payload });
       state.persistedAt = payload.persistedAt;
       return true;
     } catch (error) {
       this._logger.warn?.('[pi-bridge] failed to persist console buffer', { tabId, error });
+      return false;
+    }
+  }
+
+  async clearPersistedTab(tabId) {
+    if (!this._storageArea) return false;
+    try {
+      await storageAreaRemove(this._storageArea, [this._storageKey(tabId)]);
+      return true;
+    } catch (error) {
+      this._logger.warn?.('[pi-bridge] failed to remove persisted console buffer', { tabId, error });
       return false;
     }
   }
@@ -214,6 +224,7 @@ export class ConsoleBufferManager {
   _resetArmState(state, { releaseLease = false } = {}) {
     this._clearSubscriptions(state);
     state.armed = false;
+    state.armGeneration = (state.armGeneration || 0) + 1;
     const lease = state.lease;
     state.lease = null;
     if (releaseLease && lease) {
@@ -223,6 +234,12 @@ export class ConsoleBufferManager {
 
   async armTab(tabId) {
     const state = this._getState(tabId);
+    // Capture the arm generation BEFORE any await so that a concurrent
+    // disconnectTab / releaseTab (which runs synchronously up to its first
+    // real await and bumps armGeneration) is visible to this arming attempt.
+    const myGeneration = state.armGeneration;
+    const isStale = () => state.armGeneration !== myGeneration;
+
     await this.hydrateTab(tabId);
 
     if (state.armingPromise) {
@@ -238,17 +255,35 @@ export class ConsoleBufferManager {
 
     state.armingPromise = (async () => {
       if (!this._inspector) {
+        if (isStale()) return state;
         state.armed = true;
         return state;
       }
 
       const subscriptions = [];
       let lease = null;
+      const teardownSubscriptions = () => {
+        for (const off of subscriptions) {
+          try { off?.(); } catch { /* noop */ }
+        }
+        subscriptions.length = 0;
+      };
+      const releaseAcquiredLease = async () => {
+        if (lease) {
+          try { await this._inspector.release?.(lease); } catch { /* noop */ }
+          lease = null;
+        }
+      };
       try {
         if (typeof this._inspector.acquire === 'function') {
           lease = await this._inspector.acquire(tabId);
         } else {
           await this._inspector.ensureAttached?.(tabId, { requireLease: false });
+        }
+
+        if (isStale()) {
+          await releaseAcquiredLease();
+          return state;
         }
 
         subscriptions.push(this._inspector?.on?.(tabId, 'Runtime.consoleAPICalled', (params) => {
@@ -300,8 +335,24 @@ export class ConsoleBufferManager {
           }
         }));
 
+        if (isStale()) {
+          teardownSubscriptions();
+          await releaseAcquiredLease();
+          return state;
+        }
+
         await this._inspector.sendCommand?.(tabId, 'Runtime.enable', {}, { requireLease: !!lease });
+        if (isStale()) {
+          teardownSubscriptions();
+          await releaseAcquiredLease();
+          return state;
+        }
         await this._inspector.sendCommand?.(tabId, 'Log.enable', {}, { requireLease: !!lease });
+        if (isStale()) {
+          teardownSubscriptions();
+          await releaseAcquiredLease();
+          return state;
+        }
 
         state.subscriptions = subscriptions.filter(Boolean);
         state.lease = lease;
@@ -343,6 +394,24 @@ export class ConsoleBufferManager {
     return state;
   }
 
+  async removeTab(tabId, { persist = true } = {}) {
+    const state = this._states.get(tabId);
+    if (!state) return;
+    this._clearSubscriptions(state);
+    state.armed = false;
+    state.armGeneration = (state.armGeneration || 0) + 1;
+    const lease = state.lease;
+    state.lease = null;
+    if (persist) {
+      await this.persistTab(tabId).catch(() => {});
+    }
+    if (lease) {
+      try { await this._inspector?.release?.(lease); } catch { /* noop */ }
+    }
+    await this.clearPersistedTab(tabId).catch(() => {});
+    this._states.delete(tabId);
+  }
+
   async flushAll() {
     const results = [];
     for (const tabId of this._states.keys()) {
@@ -356,6 +425,7 @@ export class ConsoleBufferManager {
     if (!state) return;
     this._clearSubscriptions(state);
     state.armed = false;
+    state.armGeneration = (state.armGeneration || 0) + 1;
     const lease = state.lease;
     state.lease = null;
     await this.persistTab(tabId);

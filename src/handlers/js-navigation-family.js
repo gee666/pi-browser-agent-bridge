@@ -2,6 +2,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000;
 const DEFAULT_EVALUATE_TIMEOUT_MS = 15_000;
 const DEFAULT_RUN_JS_TIMEOUT_MS = 30_000;
+const DEFAULT_SETTLE_QUIET_MS = 500;
 
 function createProtocolError(code, message, details) {
   const error = new Error(message);
@@ -154,23 +155,66 @@ async function waitForTabSettled(tabId, deps, waitUntil = 'load', timeoutMs = DE
     return await deps.waitForTabSettled(tabId, { waitUntil, timeoutMs, ...options });
   }
 
-  const { tabsApi } = deps;
-  const immediate = await tabsApi.get(tabId).catch(() => null);
-  if (!options.skipImmediateComplete && immediate && immediate.status === 'complete') {
-    return immediate;
+  // networkidle cannot be implemented meaningfully without a CDP-backed custom
+  // waiter (tabs.onUpdated carries no network-activity signal). Refuse it here
+  // rather than silently degrade to `load` semantics.
+  if (waitUntil === 'networkidle') {
+    throw createProtocolError(
+      'E_VALIDATION',
+      'wait_until="networkidle" requires a custom waiter; none is configured for the default fallback',
+      { waitUntil },
+    );
   }
+
+  const { tabsApi } = deps;
+  const quietMs = Number.isFinite(options.settleQuietMs) && options.settleQuietMs >= 0
+    ? Number(options.settleQuietMs)
+    : DEFAULT_SETTLE_QUIET_MS;
+  const wantsSettle = waitUntil === 'settle';
 
   let cleanup = () => {};
 
   return await withTimeout(
     () => new Promise((resolve, reject) => {
+      let settledTab = null;
+      let quietTimer = null;
+
+      const clearQuietTimer = () => {
+        if (quietTimer) {
+          clearTimeout(quietTimer);
+          quietTimer = null;
+        }
+      };
+
+      const finish = (tab) => {
+        cleanup();
+        resolve(tab);
+      };
+
+      const armQuietTimer = (tab) => {
+        clearQuietTimer();
+        settledTab = tab;
+        quietTimer = setTimeout(() => finish(settledTab), quietMs);
+        quietTimer?.unref?.();
+      };
+
       const onUpdated = (updatedTabId, changeInfo, tab) => {
         if (updatedTabId !== tabId) {
           return;
         }
+        if (wantsSettle) {
+          // Any update resets the quiet window.
+          clearQuietTimer();
+          if (changeInfo?.status === 'complete') {
+            armQuietTimer(tab);
+          } else if (settledTab) {
+            // previously complete but received a new update -> wait again
+            settledTab = null;
+          }
+          return;
+        }
         if (changeInfo?.status === 'complete') {
-          cleanup();
-          resolve(tab);
+          finish(tab);
         }
       };
 
@@ -183,12 +227,27 @@ async function waitForTabSettled(tabId, deps, waitUntil = 'load', timeoutMs = DE
       };
 
       cleanup = () => {
+        clearQuietTimer();
         tabsApi.onUpdated?.removeListener?.(onUpdated);
         tabsApi.onRemoved?.removeListener?.(onRemoved);
       };
 
       tabsApi.onUpdated?.addListener?.(onUpdated);
       tabsApi.onRemoved?.addListener?.(onRemoved);
+
+      // Kick things off: check the current tab state.
+      Promise.resolve(tabsApi.get(tabId))
+        .then((immediate) => {
+          if (!immediate) return;
+          if (!options.skipImmediateComplete && immediate.status === 'complete') {
+            if (wantsSettle) {
+              armQuietTimer(immediate);
+            } else {
+              finish(immediate);
+            }
+          }
+        })
+        .catch(() => {});
     }),
     {
       timeoutMs,
@@ -209,6 +268,14 @@ async function waitForNavigationAfterAction(tabId, deps, action, waitUntil = 'lo
 
   if (typeof deps.waitForNavigationAfterAction === 'function') {
     return await deps.waitForNavigationAfterAction(tabId, action, { waitUntil, timeoutMs });
+  }
+
+  if (waitUntil === 'networkidle' && typeof deps.waitForTabSettled !== 'function') {
+    throw createProtocolError(
+      'E_VALIDATION',
+      'wait_until="networkidle" requires a custom waiter; none is configured for the default fallback',
+      { waitUntil },
+    );
   }
 
   const { tabsApi } = deps;

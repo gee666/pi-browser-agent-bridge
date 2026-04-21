@@ -135,6 +135,156 @@ test('network buffer does not clobber live entries on repeated armTab calls', as
   assert.equal(result.entries[0].url, 'https://x.test');
 });
 
+test('network buffer armTab abandons work if releaseTab wins the race', async () => {
+  let resolveAcquire;
+  const acquireGate = new Promise((resolve) => { resolveAcquire = resolve; });
+  let releaseCount = 0;
+  const inspector = {
+    isAttached() { return true; },
+    async acquire() { await acquireGate; return { leaseId: 1 }; },
+    async release() { releaseCount += 1; },
+    async sendCommand() {},
+    on() { return () => {}; },
+  };
+  const buffer = new NetworkBufferManager({ inspector, logger: { warn() {} } });
+
+  const arming = buffer.armTab(30);
+  await buffer.releaseTab(30);
+  resolveAcquire();
+  await arming;
+
+  const state = buffer._states.get(30);
+  assert.equal(state.armed, false);
+  assert.equal(state.subscriptions.length, 0);
+  assert.equal(state.lease, null);
+  assert.equal(releaseCount, 1);
+});
+
+test('network buffer armTab abandons work if disconnectTab wins the race', async () => {
+  let resolveAcquire;
+  const acquireGate = new Promise((resolve) => { resolveAcquire = resolve; });
+  let releaseCount = 0;
+  const inspector = {
+    isAttached() { return true; },
+    async acquire() { await acquireGate; return { leaseId: 1 }; },
+    async release() { releaseCount += 1; },
+    async sendCommand() {},
+    on() { return () => {}; },
+  };
+  const buffer = new NetworkBufferManager({ inspector, logger: { warn() {} } });
+
+  const arming = buffer.armTab(31);
+  buffer.disconnectTab(31, 'debugger_detach');
+  resolveAcquire();
+  await arming;
+
+  const state = buffer._states.get(31);
+  assert.equal(state.armed, false);
+  assert.equal(state.subscriptions.length, 0);
+  assert.equal(state.lease, null);
+  assert.equal(releaseCount, 1);
+});
+
+test('network buffer hydrate rejects on chrome.runtime.lastError and warns', async () => {
+  const originalChrome = globalThis.chrome;
+  globalThis.chrome = { runtime: { lastError: { message: 'storage broken' } } };
+  const warnings = [];
+  const buffer = new NetworkBufferManager({
+    storageArea: {
+      get(_keys, cb) { cb({}); },
+      set(_values, cb) { cb?.(); },
+    },
+    logger: { warn(...args) { warnings.push(args); } },
+  });
+  try {
+    await buffer.hydrateTab(50);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0][0]), /failed to hydrate network buffer/);
+});
+
+test('network buffer persist returns false when chrome.runtime.lastError fires', async () => {
+  const originalChrome = globalThis.chrome;
+  const warnings = [];
+  const buffer = new NetworkBufferManager({
+    storageArea: {
+      get(_keys, cb) { cb({}); },
+      set(_values, cb) {
+        globalThis.chrome = { runtime: { lastError: { message: 'quota exceeded' } } };
+        cb?.();
+        globalThis.chrome = originalChrome;
+      },
+    },
+    logger: { warn(...args) { warnings.push(args); } },
+  });
+  buffer.startRequest(70, { requestId: 'a', request: { url: 'https://t.test', method: 'GET' }, type: 'document', timestamp: 1 });
+  buffer.finishRequest(70, { requestId: 'a', timestamp: 1.1 });
+  const ok = await buffer.persistTab(70);
+  assert.equal(ok, false);
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0][0]), /failed to persist network buffer/);
+});
+
+test('network buffer removeTab drops in-memory state and persisted storage key', async () => {
+  const storageArea = createStorageArea();
+  const removedKeys = [];
+  const wrappedStorage = {
+    ...storageArea,
+    get: storageArea.get.bind(storageArea),
+    set: storageArea.set.bind(storageArea),
+    remove(keys, cb) {
+      const list = Array.isArray(keys) ? keys : [keys];
+      removedKeys.push(...list);
+      for (const key of list) delete storageArea.store[key];
+      cb?.();
+    },
+  };
+  const buffer = new NetworkBufferManager({ storageArea: wrappedStorage, logger: { warn() {} } });
+  buffer.startRequest(88, { requestId: 'x', request: { url: 'https://y.test', method: 'GET' }, type: 'document', timestamp: 1 });
+  buffer.finishRequest(88, { requestId: 'x', timestamp: 1.1 });
+  await buffer.persistTab(88);
+  assert.ok(storageArea.store['piBridge.networkBuf.88']);
+
+  await buffer.removeTab(88, { persist: false });
+
+  assert.equal(buffer._states.has(88), false);
+  assert.deepEqual(removedKeys, ['piBridge.networkBuf.88']);
+  assert.equal(storageArea.store['piBridge.networkBuf.88'], undefined);
+});
+
+test('network buffer finalizes in-flight requests as interrupted on disconnect', async () => {
+  const buffer = new NetworkBufferManager({ logger: { warn() {} } });
+  buffer.startRequest(40, { requestId: 'r1', request: { url: 'https://z.test', method: 'GET' }, type: 'fetch', timestamp: 1 });
+  buffer.updateResponse(40, { requestId: 'r1', response: { status: 200, mimeType: 'application/json' } });
+  // Do NOT finish -> request is still in-flight.
+  assert.equal(buffer._states.get(40).inFlight.size, 1);
+
+  buffer.disconnectTab(40, 'sw_restart');
+
+  const state = buffer._states.get(40);
+  assert.equal(state.inFlight.size, 0);
+  assert.equal(state.entries.length, 1);
+  assert.equal(state.entries[0].interrupted, true);
+  assert.equal(state.entries[0].interruptedReason, 'interrupted:sw_restart');
+  assert.equal(state.entries[0].failed, true);
+});
+
+test('network buffer finalizes in-flight requests when flushAll is asked to do so (suspend)', async () => {
+  const storageArea = createStorageArea();
+  const buffer = new NetworkBufferManager({ storageArea, logger: { warn() {} } });
+  buffer.startRequest(41, { requestId: 's1', request: { url: 'https://zz.test', method: 'POST' }, type: 'fetch', timestamp: 1 });
+
+  await buffer.flushAll({ finalizeInFlight: true, reason: 'suspend' });
+
+  const state = buffer._states.get(41);
+  assert.equal(state.inFlight.size, 0);
+  assert.equal(state.entries[0].interrupted, true);
+  assert.match(state.entries[0].interruptedReason, /suspend/);
+  assert.ok(storageArea.store['piBridge.networkBuf.41']);
+});
+
 test('network buffer re-arms after debugger disconnect', async () => {
   let attached = false;
   let acquireCount = 0;

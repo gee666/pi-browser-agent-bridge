@@ -1,3 +1,5 @@
+import { storageAreaGet, storageAreaRemove, storageAreaSet } from './storage.js';
+
 const DEFAULT_MAX_ENTRIES = 500;
 const DEFAULT_BODY_MAX_BYTES = 64 * 1024;
 const DEFAULT_BODY_TIMEOUT_MS = 2_000;
@@ -61,6 +63,7 @@ function createTabState(tabId) {
     disconnectedAt: undefined,
     disconnectReason: undefined,
     lease: null,
+    armGeneration: 0,
   };
 }
 
@@ -105,13 +108,18 @@ function normalizeRequest(tabId, params) {
 }
 
 async function withTimeout(factory, timeoutMs) {
-  return await Promise.race([
-    Promise.resolve().then(factory),
-    new Promise((_, reject) => {
-      const timer = setTimeout(() => reject(Object.assign(new Error('Timed out'), { code: 'E_TIMEOUT' })), timeoutMs);
-      timer.unref?.();
-    }),
-  ]);
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(factory),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Object.assign(new Error('Timed out'), { code: 'E_TIMEOUT' })), timeoutMs);
+        timer?.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export class NetworkBufferManager {
@@ -157,9 +165,7 @@ export class NetworkBufferManager {
       return state;
     }
     try {
-      const stored = await new Promise((resolve) => {
-        this._storageArea.get([this._storageKey(tabId)], (result) => resolve(result || {}));
-      });
+      const stored = await storageAreaGet(this._storageArea, [this._storageKey(tabId)]);
       const payload = stored?.[this._storageKey(tabId)] || {};
       state.entries = safeArray(payload.entries).slice(-this._maxEntries);
       state.persistedAt = Number.isFinite(payload.persistedAt) ? payload.persistedAt : 0;
@@ -186,15 +192,46 @@ export class NetworkBufferManager {
         disconnectedAt: state.disconnectedAt,
         disconnectReason: state.disconnectReason,
       };
-      await new Promise((resolve) => {
-        this._storageArea.set({ [this._storageKey(tabId)]: payload }, () => resolve());
-      });
+      await storageAreaSet(this._storageArea, { [this._storageKey(tabId)]: payload });
       state.persistedAt = payload.persistedAt;
       return true;
     } catch (error) {
       this._logger.warn?.('[pi-bridge] failed to persist network buffer', { tabId, error });
       return false;
     }
+  }
+
+  async clearPersistedTab(tabId) {
+    if (!this._storageArea) return false;
+    try {
+      await storageAreaRemove(this._storageArea, [this._storageKey(tabId)]);
+      return true;
+    } catch (error) {
+      this._logger.warn?.('[pi-bridge] failed to remove persisted network buffer', { tabId, error });
+      return false;
+    }
+  }
+
+  finalizeInFlight(tabId, { reason = 'interrupted', status = 'interrupted' } = {}) {
+    const state = this._states.get(tabId);
+    if (!state || state.inFlight.size === 0) return [];
+    const finalized = [];
+    const now = Date.now();
+    for (const [requestId, entry] of state.inFlight) {
+      entry.failed = true;
+      entry.errorText = entry.errorText || reason;
+      entry.interrupted = true;
+      entry.interruptedReason = reason;
+      entry.interruptedStatus = status;
+      if (entry.durationMs === undefined) {
+        entry.durationMs = Math.max(0, now - (entry.startTime || now));
+      }
+      state.entries.push(entry);
+      finalized.push(requestId);
+    }
+    state.inFlight.clear();
+    trimState(state, this._maxEntries, this._persistMaxBytes);
+    return finalized;
   }
 
   startRequest(tabId, params) {
@@ -262,6 +299,7 @@ export class NetworkBufferManager {
   _resetArmState(state, { releaseLease = false } = {}) {
     this._clearSubscriptions(state);
     state.armed = false;
+    state.armGeneration = (state.armGeneration || 0) + 1;
     const lease = state.lease;
     state.lease = null;
     if (releaseLease && lease) {
@@ -271,6 +309,12 @@ export class NetworkBufferManager {
 
   async armTab(tabId) {
     const state = this._getState(tabId);
+    // Capture the arm generation BEFORE any await so that a concurrent
+    // disconnectTab / releaseTab (which runs synchronously up to its first
+    // real await and bumps armGeneration) is visible to this arming attempt.
+    const myGeneration = state.armGeneration;
+    const isStale = () => state.armGeneration !== myGeneration;
+
     await this.hydrateTab(tabId);
 
     if (state.armingPromise) {
@@ -286,17 +330,35 @@ export class NetworkBufferManager {
 
     state.armingPromise = (async () => {
       if (!this._inspector) {
+        if (isStale()) return state;
         state.armed = true;
         return state;
       }
 
       const subscriptions = [];
       let lease = null;
+      const teardownSubscriptions = () => {
+        for (const off of subscriptions) {
+          try { off?.(); } catch { /* noop */ }
+        }
+        subscriptions.length = 0;
+      };
+      const releaseAcquiredLease = async () => {
+        if (lease) {
+          try { await this._inspector.release?.(lease); } catch { /* noop */ }
+          lease = null;
+        }
+      };
       try {
         if (typeof this._inspector.acquire === 'function') {
           lease = await this._inspector.acquire(tabId);
         } else {
           await this._inspector.ensureAttached?.(tabId, { requireLease: false });
+        }
+
+        if (isStale()) {
+          await releaseAcquiredLease();
+          return state;
         }
 
         subscriptions.push(this._inspector?.on?.(tabId, 'Network.requestWillBeSent', (params) => {
@@ -328,7 +390,19 @@ export class NetworkBufferManager {
           }
         }));
 
+        if (isStale()) {
+          teardownSubscriptions();
+          await releaseAcquiredLease();
+          return state;
+        }
+
         await this._inspector.sendCommand?.(tabId, 'Network.enable', {}, { requireLease: !!lease });
+
+        if (isStale()) {
+          teardownSubscriptions();
+          await releaseAcquiredLease();
+          return state;
+        }
 
         state.subscriptions = subscriptions.filter(Boolean);
         state.lease = lease;
@@ -366,8 +440,27 @@ export class NetworkBufferManager {
     const state = this._getState(tabId);
     state.disconnectedAt = Date.now();
     state.disconnectReason = reason;
+    this.finalizeInFlight(tabId, { reason: `interrupted:${reason}`, status: 'interrupted' });
     this._resetArmState(state, { releaseLease: true });
     return state;
+  }
+
+  async removeTab(tabId, { persist = true } = {}) {
+    const state = this._states.get(tabId);
+    if (!state) return;
+    this._clearSubscriptions(state);
+    state.armed = false;
+    state.armGeneration = (state.armGeneration || 0) + 1;
+    const lease = state.lease;
+    state.lease = null;
+    if (persist) {
+      await this.persistTab(tabId).catch(() => {});
+    }
+    if (lease) {
+      try { await this._inspector?.release?.(lease); } catch { /* noop */ }
+    }
+    await this.clearPersistedTab(tabId).catch(() => {});
+    this._states.delete(tabId);
   }
 
   async fetchResponseBody(tabId, requestId, { bodyMaxBytes = DEFAULT_BODY_MAX_BYTES } = {}) {
@@ -485,7 +578,12 @@ export class NetworkBufferManager {
     };
   }
 
-  async flushAll() {
+  async flushAll({ finalizeInFlight = false, reason = 'suspend' } = {}) {
+    if (finalizeInFlight) {
+      for (const tabId of this._states.keys()) {
+        this.finalizeInFlight(tabId, { reason: `interrupted:${reason}`, status: 'interrupted' });
+      }
+    }
     const results = [];
     for (const tabId of this._states.keys()) {
       results.push(await this.persistTab(tabId));
@@ -498,6 +596,7 @@ export class NetworkBufferManager {
     if (!state) return;
     this._clearSubscriptions(state);
     state.armed = false;
+    state.armGeneration = (state.armGeneration || 0) + 1;
     const lease = state.lease;
     state.lease = null;
     await this.persistTab(tabId);

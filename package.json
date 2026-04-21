@@ -4,6 +4,14 @@
   "type": "module",
   "main": "./src/index.js",
   "exports": {
-    ".": "./src/index.js"
+    ".": "./src/index.js",
+    "./dispatcher": "./src/dispatcher.js",
+    "./buffers/lifecycle": "./src/buffers/lifecycle.js",
+    "./buffers/console-buffer": "./src/buffers/console-buffer.js",
+    "./buffers/network-buffer": "./src/buffers/network-buffer.js",
+    "./buffers/storage": "./src/buffers/storage.js",
+    "./handlers/observability-family": "./src/handlers/observability-family.js",
+    "./handlers/js-navigation-family": "./src/handlers/js-navigation-family.js",
+    "./handlers/read-only": "./src/handlers/read-only/index.js"
   }
 }
