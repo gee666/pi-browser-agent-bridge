@@ -1,4 +1,9 @@
-const DEFAULT_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000];
+// Reconnect schedule. Kept short so that when a pi-browser-agent broker comes
+// up on one of the URLs we are watching (e.g. a new pi instance bound to a
+// port previously unreachable), we connect to it within a few seconds rather
+// than sitting idle through a 10s backoff. The list is also the cap — the
+// last value repeats forever.
+const DEFAULT_RECONNECT_DELAYS_MS = [500, 1000, 2000, 3000, 5000];
 const PROTOCOL_VERSION = 1;
 
 function toProtocolError(error) {

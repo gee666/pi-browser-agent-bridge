@@ -26,6 +26,7 @@ export function createBridgeController({
       nextBridge = await startBridgeImpl({
         enabled: config.enabled,
         url: config.url,
+        urls: config.urls,
         autoConnect: true,
         logger,
       });

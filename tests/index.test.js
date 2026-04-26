@@ -52,8 +52,10 @@ test('startBridge catches startup failures instead of throwing', async () => {
 
   const bridge = await startBridge({
     logger,
+    urls: ['ws://only-one:1234'],
     createClient() {
       return {
+        url: 'ws://only-one:1234',
         async start() {
           throw new Error('boom');
         },
