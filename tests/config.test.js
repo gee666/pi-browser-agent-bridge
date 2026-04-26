@@ -44,6 +44,16 @@ test('normalizePiBridgeConfig auto-migrates a legacy single-URL default to the f
   assert.ok(out.urls.includes('ws://127.0.0.1:7879'));
 });
 
+test('normalizePiBridgeConfig auto-migrates a saved single-entry urls default to the full range', () => {
+  // A user may have opened/saved the options page after the textarea change,
+  // leaving chrome.storage with `urls: ["ws://127.0.0.1:7878"]`. That should
+  // also expand; otherwise only the first pi instance can connect.
+  const out = normalizePiBridgeConfig({ enabled: true, urls: [' ws://127.0.0.1:7878 '] });
+  assert.ok(out.urls.length >= 2, `expected migrated range, got ${JSON.stringify(out.urls)}`);
+  assert.equal(out.urls[0], 'ws://127.0.0.1:7878');
+  assert.ok(out.urls.includes('ws://127.0.0.1:7879'));
+});
+
 test('normalizePiBridgeConfig keeps a custom legacy url as a single entry (no migration)', () => {
   const out = normalizePiBridgeConfig({ enabled: true, url: 'ws://my-custom-host:9999' });
   assert.deepEqual(out.urls, ['ws://my-custom-host:9999']);

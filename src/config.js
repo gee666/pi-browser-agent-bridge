@@ -64,13 +64,19 @@ export function normalizePiBridgeConfig(rawConfig = {}) {
   // Prefer the multi-URL field; fall back to the legacy single `url` field
   // for backward compatibility with existing stored configs.
   let urls = parseUrlsField(config.urls);
+
+  // Migration: users who opened/saved the options page before this fix may
+  // have `urls: ["ws://127.0.0.1:7878"]` stored, not just legacy
+  // `url: "ws://127.0.0.1:7878"`. Treat either representation of the OLD
+  // default single URL as an upgrade candidate and expand it to the whole
+  // default range. Custom single URLs remain custom and are not expanded.
+  if (urls.length === 1 && urls[0] === LEGACY_DEFAULT_SINGLE_URL) {
+    urls = [...DEFAULT_PI_BRIDGE_CONFIG.urls];
+  }
+
   if (urls.length === 0) {
     const legacy = typeof config.url === 'string' ? config.url.trim() : '';
     if (legacy) {
-      // Migration: a stored config that only carried the OLD default single
-      // URL is almost certainly a pre-multi-instance config left over from
-      // an upgrade. Expand it to the new default range so the extension can
-      // reach pi instances that bound to a different port in the range.
       if (legacy === LEGACY_DEFAULT_SINGLE_URL) {
         urls = [...DEFAULT_PI_BRIDGE_CONFIG.urls];
       } else {
