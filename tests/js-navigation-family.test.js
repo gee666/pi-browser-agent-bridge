@@ -26,6 +26,27 @@ function createTabApis() {
       async query(queryInfo) {
         return [...tabs.values()].filter((tab) => (!queryInfo.active || tab.active));
       },
+      async create(createProperties) {
+        const id = Math.max(...tabs.keys()) + 1;
+        const tab = {
+          id,
+          url: createProperties.url,
+          title: 'New tab',
+          status: 'loading',
+          windowId: createProperties.windowId || 1,
+          active: !!createProperties.active,
+          pinned: !!createProperties.pinned,
+        };
+        tabs.set(id, tab);
+        queueMicrotask(() => {
+          const settled = { ...tab, status: 'complete', title: 'Created page' };
+          tabs.set(id, settled);
+          for (const listener of updatedListeners) {
+            listener(id, { status: 'complete' }, { ...settled });
+          }
+        });
+        return { ...tab };
+      },
       async update(tabId, changes) {
         const current = tabs.get(tabId);
         if (!current) throw new Error(`missing tab ${tabId}`);
@@ -149,6 +170,7 @@ test('handler family exports the expected request names', () => {
   assert.deepEqual(JS_NAVIGATION_DESTRUCTIVE_HANDLER_NAMES, [
     'browser_evaluate_js',
     'browser_run_js',
+    'browser_create_tab',
     'browser_navigate',
     'browser_switch_tab',
     'browser_close_tab',
@@ -220,6 +242,11 @@ test('navigation family handlers perform tab operations without crashing the cal
   const { tabsApi, windowsApi, tabs } = createTabApis();
   const inspector = createInspector();
   const handlers = createJsNavigationDestructiveHandlers({ tabsApi, windowsApi, inspector, resolveDefaultTabId: async () => 11 });
+
+  const created = await handlers.browser_create_tab({ url: 'https://example.com/own', active: false, pinned: true, timeout_ms: 200 });
+  assert.equal(created.tabId, 13);
+  assert.equal(created.url, 'https://example.com/own');
+  assert.equal(created.pinned, true);
 
   const navigated = await handlers.browser_navigate({ url: 'https://example.com/next', timeout_ms: 200 });
   assert.equal(navigated.url, 'https://example.com/next');

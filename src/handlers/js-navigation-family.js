@@ -560,6 +560,50 @@ export function createJsNavigationDestructiveHandlers(deps = {}) {
       });
     },
 
+    async browser_create_tab(params = {}) {
+      if (!deps.tabsApi || typeof deps.tabsApi.create !== 'function') {
+        throw createProtocolError('E_INTERNAL', 'tabs.create API is required for browser_create_tab');
+      }
+
+      const url = params.url == null || params.url === ''
+        ? 'https://example.com/'
+        : ensureUrl(params.url);
+      const createProperties = {
+        url,
+        active: params.active === true,
+        pinned: params.pinned === true,
+      };
+      if (typeof params.window_id === 'number') {
+        createProperties.windowId = params.window_id;
+      }
+
+      const created = await deps.tabsApi.create(createProperties).catch((error) => {
+        throw createProtocolError('E_INTERNAL', 'Failed to create tab', normalizeError(error));
+      });
+      if (!created || typeof created.id !== 'number') {
+        throw createProtocolError('E_INTERNAL', 'Created tab did not include a tab id', { tab: created });
+      }
+
+      if (typeof deps.armObservability === 'function') {
+        await Promise.resolve(deps.armObservability(created.id)).catch(() => {});
+      }
+
+      const waitUntil = params.wait_until || 'load';
+      const settled = waitUntil === 'none'
+        ? created
+        : await waitForTabSettled(created.id, deps, waitUntil, params.timeout_ms ?? DEFAULT_NAVIGATION_TIMEOUT_MS);
+
+      return {
+        tabId: created.id,
+        url: settled?.url || created.url || url,
+        title: settled?.title || created.title,
+        active: !!(settled?.active ?? created.active),
+        pinned: !!(settled?.pinned ?? created.pinned),
+        windowId: settled?.windowId ?? created.windowId,
+        status: settled?.status || created.status,
+      };
+    },
+
     async browser_navigate(params = {}) {
       const url = ensureUrl(params.url);
       const tab = await resolveTargetTab(params, deps);
@@ -739,6 +783,7 @@ export function createJsNavigationDestructiveRequestHandler(deps = {}) {
 export const JS_NAVIGATION_DESTRUCTIVE_HANDLER_NAMES = Object.freeze([
   'browser_evaluate_js',
   'browser_run_js',
+  'browser_create_tab',
   'browser_navigate',
   'browser_switch_tab',
   'browser_close_tab',
