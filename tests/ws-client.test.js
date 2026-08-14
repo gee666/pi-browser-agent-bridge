@@ -216,6 +216,35 @@ test('stale sockets do not deliver open/message/error/close callbacks after repl
   await client.stop();
 });
 
+test('connect watchdog force-closes a socket wedged in CONNECTING and reconnects', async () => {
+  const sockets = [];
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    reconnectDelaysMs: [1],
+    connectTimeoutMs: 10,
+    logger: { error() {}, info() {}, warn() {} },
+    webSocketFactory() {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+  });
+
+  await client.start();
+  assert.equal(sockets.length, 1);
+  // First socket stays in CONNECTING (readyState 0) and never fires any event.
+  const first = sockets[0];
+
+  // Give the watchdog time to fire, force-close, and schedule a reconnect.
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(first.closed, 1, 'stuck socket should be force-closed');
+  assert.ok(sockets.length >= 2, 'a reconnect attempt should have been made');
+  assert.equal(client.isConnected, false);
+
+  await client.stop();
+});
+
 test('send contains onError callback failures and still returns false', async () => {
   const socket = new FakeSocket();
   const errors = [];
@@ -246,5 +275,142 @@ test('send contains onError callback failures and still returns false', async ()
   assert.equal(client.send({ kind: 'ping' }), false);
   assert.equal(errors.length, 1);
   assert.match(String(errors[0][0]), /error callback failed/);
+  await client.stop();
+});
+
+// ─── Receive-side liveness ───────────────────────────────────────────────────
+// Regression guard for the outage where the extension held an OPEN-but-dead
+// socket forever: every pi broker reported "bridge disconnected" while Chrome
+// was running and the extension believed it was still connected.
+
+test('client tracks received frames so a silent socket can be detected', async () => {
+  const socket = new FakeSocket();
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    webSocketFactory: () => socket,
+  });
+
+  await client.start();
+  socket.readyState = 1;
+  socket.emit('open');
+
+  // Freshly opened sockets count as just-heard-from.
+  assert.ok(client.msSinceLastReceive < 1000);
+  const firstStamp = client.lastReceivedAt;
+  assert.ok(firstStamp > 0);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  socket.emit('message', { data: JSON.stringify({ v: 1, kind: 'response', id: 'x', ok: true, data: {} }) });
+  assert.ok(client.lastReceivedAt >= firstStamp);
+  assert.ok(client.msSinceLastReceive < 1000);
+
+  await client.stop();
+  // A stopped client is never considered "recently heard from".
+  assert.equal(client.msSinceLastReceive, Infinity);
+});
+
+test('forceReconnect replaces a zombie socket even if it never emits close', async () => {
+  const sockets = [];
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    webSocketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  sockets[0].readyState = 1;
+  sockets[0].emit('open');
+  assert.equal(client.isConnected, true);
+
+  // The peer vanished without a FIN: readyState stays OPEN and no close fires.
+  assert.equal(client.forceReconnect('test zombie'), true);
+
+  assert.equal(sockets[0].closed, 1);
+  assert.equal(sockets.length, 2, 'a replacement socket must be created immediately');
+
+  sockets[1].readyState = 1;
+  sockets[1].emit('open');
+  assert.equal(client.isConnected, true);
+  assert.ok(client.msSinceLastReceive < 1000);
+
+  // A late close event from the abandoned socket must not tear down the new one.
+  sockets[0].emit('close', { code: 1006 });
+  assert.equal(client.isConnected, true);
+
+  await client.stop();
+});
+
+test('forceReconnect is a no-op after stop() so a stopped bridge stays stopped', async () => {
+  const sockets = [];
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    webSocketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  sockets[0].readyState = 1;
+  sockets[0].emit('open');
+  await client.stop();
+
+  assert.equal(client.forceReconnect('after stop'), false);
+  assert.equal(sockets.length, 1);
+});
+
+test('forceReconnect notifies onClose so consumers observe the disconnect', async () => {
+  const sockets = [];
+  const closes = [];
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    webSocketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    onClose: (event) => closes.push(event),
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  sockets[0].readyState = 1;
+  sockets[0].emit('open');
+
+  client.forceReconnect('zombie socket');
+
+  // Without this a forced drop would silently look like "still connected" to
+  // every consumer, unlike a real close event.
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0].code, 4000);
+  assert.equal(closes[0].reason, 'zombie socket');
+});
+
+test('forceReconnect accepts resetBackoff:false and still replaces the socket', async () => {
+  const sockets = [];
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    webSocketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  sockets[0].readyState = 1;
+  sockets[0].emit('open');
+
+  assert.equal(client.forceReconnect('escalating', { resetBackoff: false }), true);
+  assert.equal(sockets.length, 2);
+  assert.equal(sockets[0].closed, 1);
+
   await client.stop();
 });
