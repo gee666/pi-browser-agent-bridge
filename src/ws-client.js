@@ -6,6 +6,30 @@
 const DEFAULT_RECONNECT_DELAYS_MS = [500, 1000, 2000, 3000, 5000];
 const PROTOCOL_VERSION = 1;
 
+function isValidIncomingProtocolFrame(frame) {
+  if (!frame || frame.v !== PROTOCOL_VERSION || typeof frame.kind !== 'string') return false;
+  switch (frame.kind) {
+    case 'welcome':
+      return typeof frame.brokerVersion === 'string' && typeof frame.serverTime === 'number';
+    case 'request':
+      return typeof frame.id === 'string' && typeof frame.type === 'string';
+    case 'response': {
+      if (typeof frame.id !== 'string' || typeof frame.ok !== 'boolean') return false;
+      if (frame.ok) return frame.error === undefined;
+      return !!frame.error
+        && typeof frame.error === 'object'
+        && typeof frame.error.code === 'string'
+        && typeof frame.error.message === 'string';
+    }
+    case 'probe':
+      return frame.id === undefined || typeof frame.id === 'string';
+    case 'notify':
+      return typeof frame.event === 'string';
+    default:
+      return false;
+  }
+}
+
 function toProtocolError(error) {
   if (error && typeof error === 'object' && typeof error.code === 'string' && typeof error.message === 'string') {
     return {
@@ -145,9 +169,8 @@ export function createBridgeClient({
       nextSocket.addEventListener('open', () => {
         if (socket !== nextSocket) return;
         clearConnectTimer();
-        reconnectAttempt = 0;
         openedAt = Date.now();
-        lastReceivedAt = Date.now();
+        lastReceivedAt = 0;
         logger.info?.('[pi-bridge] connected', { url });
         if (helloPayload) {
           try {
@@ -161,7 +184,6 @@ export function createBridgeClient({
 
       nextSocket.addEventListener('message', (event) => {
         if (socket !== nextSocket) return;
-        lastReceivedAt = Date.now();
         safelyInvoke('message', onMessage, event);
 
         let frame;
@@ -170,34 +192,69 @@ export function createBridgeClient({
         } catch {
           return;
         }
+        if (!isValidIncomingProtocolFrame(frame)) return;
 
-        if (frame?.kind !== 'request' || typeof frame.id !== 'string' || typeof frame.type !== 'string' || typeof handleRequest !== 'function') {
-          return;
-        }
+        // Opening a TCP/WebSocket connection does not prove that the peer
+        // speaks our protocol. Only a valid frame restores receive liveness
+        // and clears accumulated reconnect backoff.
+        lastReceivedAt = Date.now();
+        reconnectAttempt = 0;
+
+        if (frame.kind !== 'request' || typeof handleRequest !== 'function') return;
+
+        const sendResponse = (response, { fallbackOnSerializationError = false } = {}) => {
+          let payload;
+          try {
+            payload = JSON.stringify(response);
+          } catch (error) {
+            logger.warn?.('[pi-bridge] failed to serialize response', error);
+            if (!fallbackOnSerializationError) return false;
+            // Handler output can contain BigInt, cycles, or throwing toJSON
+            // methods. Return a minimal serializable protocol error instead of
+            // silently making the broker wait for a response that never comes.
+            payload = JSON.stringify({
+              v: PROTOCOL_VERSION,
+              kind: 'response',
+              id: frame.id,
+              ok: false,
+              error: {
+                code: 'E_INTERNAL',
+                message: `Failed to serialize response: ${error instanceof Error ? error.message : String(error)}`,
+              },
+            });
+          }
+
+          if (socket !== nextSocket || nextSocket.readyState !== 1) return false;
+          try {
+            nextSocket.send(payload);
+            return true;
+          } catch (error) {
+            // A close can race the readyState check. Contain send failures here
+            // so they cannot reject the request chain and trigger a second
+            // response attempt or an unhandled rejection.
+            logger.warn?.('[pi-bridge] failed to send response', error);
+            return false;
+          }
+        };
 
         void Promise.resolve()
           .then(() => handleRequest(frame))
-          .then((data) => {
-            if (socket !== nextSocket || nextSocket.readyState !== 1) return;
-            nextSocket.send(JSON.stringify({
+          .then(
+            (data) => sendResponse({
               v: PROTOCOL_VERSION,
               kind: 'response',
               id: frame.id,
               ok: true,
               data,
-            }));
-          })
-          .catch((error) => {
-            if (socket !== nextSocket || nextSocket.readyState !== 1) return;
-            const protocolError = toProtocolError(error);
-            nextSocket.send(JSON.stringify({
+            }, { fallbackOnSerializationError: true }),
+            (error) => sendResponse({
               v: PROTOCOL_VERSION,
               kind: 'response',
               id: frame.id,
               ok: false,
-              error: protocolError,
-            }));
-          });
+              error: toProtocolError(error),
+            }),
+          );
       }, listenerOptions);
 
       nextSocket.addEventListener('error', (event) => {
@@ -243,8 +300,8 @@ export function createBridgeClient({
       return Date.now() - openedAt;
     },
     /**
-     * Drop the current socket (however wedged it looks) and reconnect straight
-     * away with a fresh backoff. This is the escape hatch for a zombie socket:
+     * Drop the current socket (however wedged it looks) and reconnect with a
+     * fresh or preserved backoff. This is the escape hatch for a zombie socket:
      * close() alone may never deliver a close event, so we null out our
      * reference first and schedule the retry ourselves.
      */
@@ -272,11 +329,15 @@ export function createBridgeClient({
         // bridge never went down. 4000 is a private-use close code.
         safelyInvoke('close', onClose, { code: 4000, reason });
       }
-      // Reset backoff: this is a health-driven reconnect, not a flap. Callers
-      // that have already forced this URL repeatedly pass resetBackoff:false so
-      // an unresponsive peer escalates instead of churning at a fixed rate.
-      if (resetBackoff) reconnectAttempt = 0;
-      void connect();
+      // A normal health-driven replacement reconnects immediately with fresh
+      // backoff. Escalated replacements preserve the attempt count and use the
+      // delayed reconnect schedule so an unresponsive peer cannot churn.
+      if (resetBackoff) {
+        reconnectAttempt = 0;
+        void connect();
+      } else {
+        scheduleReconnect();
+      }
       return true;
     },
     async start() {

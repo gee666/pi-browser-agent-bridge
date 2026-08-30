@@ -294,14 +294,13 @@ test('client tracks received frames so a silent socket can be detected', async (
   socket.readyState = 1;
   socket.emit('open');
 
-  // Freshly opened sockets count as just-heard-from.
-  assert.ok(client.msSinceLastReceive < 1000);
-  const firstStamp = client.lastReceivedAt;
-  assert.ok(firstStamp > 0);
+  // An open socket is not proof that the peer speaks the bridge protocol.
+  assert.equal(client.msSinceLastReceive, Infinity);
+  assert.equal(client.lastReceivedAt, 0);
 
   await new Promise((resolve) => setTimeout(resolve, 5));
   socket.emit('message', { data: JSON.stringify({ v: 1, kind: 'response', id: 'x', ok: true, data: {} }) });
-  assert.ok(client.lastReceivedAt >= firstStamp);
+  assert.ok(client.lastReceivedAt > 0);
   assert.ok(client.msSinceLastReceive < 1000);
 
   await client.stop();
@@ -335,6 +334,10 @@ test('forceReconnect replaces a zombie socket even if it never emits close', asy
   sockets[1].readyState = 1;
   sockets[1].emit('open');
   assert.equal(client.isConnected, true);
+  assert.equal(client.msSinceLastReceive, Infinity);
+  sockets[1].emit('message', { data: JSON.stringify({
+    v: 1, kind: 'welcome', brokerVersion: '1.0.0', serverTime: Date.now(),
+  }) });
   assert.ok(client.msSinceLastReceive < 1000);
 
   // A late close event from the abandoned socket must not tear down the new one.
@@ -392,10 +395,11 @@ test('forceReconnect notifies onClose so consumers observe the disconnect', asyn
   assert.equal(closes[0].reason, 'zombie socket');
 });
 
-test('forceReconnect accepts resetBackoff:false and still replaces the socket', async () => {
+test('forceReconnect with resetBackoff:false preserves and schedules reconnect backoff', async () => {
   const sockets = [];
   const client = createBridgeClient({
     url: 'ws://localhost:7878',
+    reconnectDelaysMs: [20, 100],
     webSocketFactory: () => {
       const socket = new FakeSocket();
       sockets.push(socket);
@@ -407,10 +411,123 @@ test('forceReconnect accepts resetBackoff:false and still replaces the socket', 
   await client.start();
   sockets[0].readyState = 1;
   sockets[0].emit('open');
+  sockets[0].emit('close', { code: 1006 });
+  await new Promise((resolve) => setTimeout(resolve, 40));
 
+  sockets[1].readyState = 1;
+  sockets[1].emit('open');
   assert.equal(client.forceReconnect('escalating', { resetBackoff: false }), true);
-  assert.equal(sockets.length, 2);
-  assert.equal(sockets[0].closed, 1);
+  assert.equal(sockets[1].closed, 1);
+  assert.equal(sockets.length, 2, 'forced reconnect must not be immediate');
 
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(sockets.length, 2, 'open alone must not reset backoff');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(sockets.length, 3);
+
+  await client.stop();
+});
+
+test('a valid protocol frame resets reconnect backoff', async () => {
+  const sockets = [];
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    reconnectDelaysMs: [20, 100],
+    webSocketFactory: () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket;
+    },
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  sockets[0].readyState = 1;
+  sockets[0].emit('open');
+  sockets[0].emit('close', { code: 1006 });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  sockets[1].readyState = 1;
+  sockets[1].emit('open');
+  sockets[1].emit('message', { data: JSON.stringify({
+    v: 1, kind: 'welcome', brokerVersion: '1.0.0', serverTime: Date.now(),
+  }) });
+
+  client.forceReconnect('healthy replacement', { resetBackoff: false });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(sockets.length, 3, 'valid frame should restore the shortest delay');
+
+  await client.stop();
+});
+
+test('unserializable success data returns one structured E_INTERNAL response', async () => {
+  const socket = new FakeSocket();
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    handleRequest: async () => ({ value: 1n }),
+    webSocketFactory: () => socket,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  socket.readyState = 1;
+  socket.emit('open');
+  socket.emit('message', { data: JSON.stringify({
+    v: 1, kind: 'request', id: 'request-bigint', type: 'browser_test',
+  }) });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(socket.sent.length, 1);
+  const response = JSON.parse(socket.sent[0]);
+  assert.equal(response.id, 'request-bigint');
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, 'E_INTERNAL');
+  assert.match(response.error.message, /serialize response/i);
+  await client.stop();
+});
+
+test('response send failures are contained and never trigger a second response', async () => {
+  const socket = new FakeSocket();
+  let responseAttempts = 0;
+  socket.send = () => {
+    responseAttempts += 1;
+    throw new Error('socket closed during send');
+  };
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    handleRequest: async () => ({ ok: true }),
+    webSocketFactory: () => socket,
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await client.start();
+  socket.readyState = 1;
+  socket.emit('open');
+  socket.emit('message', { data: JSON.stringify({
+    v: 1, kind: 'request', id: 'request-1', type: 'browser_test',
+  }) });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(responseAttempts, 1);
+  await client.stop();
+});
+
+test('malformed and foreign messages do not reset receive liveness', async () => {
+  const socket = new FakeSocket();
+  const client = createBridgeClient({
+    url: 'ws://localhost:7878',
+    webSocketFactory: () => socket,
+  });
+
+  await client.start();
+  socket.readyState = 1;
+  socket.emit('open');
+  socket.emit('message', { data: '{not-json' });
+  socket.emit('message', { data: JSON.stringify({ v: 1, kind: 'foreign' }) });
+  socket.emit('message', { data: JSON.stringify({
+    v: 1, kind: 'response', id: 'bad', ok: false,
+  }) });
+
+  assert.equal(client.lastReceivedAt, 0);
+  assert.equal(client.msSinceLastReceive, Infinity);
   await client.stop();
 });
