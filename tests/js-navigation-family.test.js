@@ -7,6 +7,17 @@ import {
   JS_NAVIGATION_DESTRUCTIVE_HANDLER_NAMES,
 } from '../src/handlers/js-navigation-family.js';
 
+test('browser_create_tab without a URL opens a blank page, not an external website', async () => {
+  const { tabsApi } = createTabApis();
+  const handlers = createJsNavigationDestructiveHandlers({ tabsApi });
+  for (const url of [undefined, null, '']) {
+    const created = await handlers.browser_create_tab({ url, wait_until: 'none' });
+    assert.equal(created.url, 'about:blank');
+    assert.equal(created.pinned, false);
+    assert.equal(created.active, false);
+  }
+});
+
 function createTabApis() {
   const tabs = new Map([
     [11, { id: 11, url: 'https://example.com/start', title: 'Start', status: 'complete', windowId: 1, active: false }],

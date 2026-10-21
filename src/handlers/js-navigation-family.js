@@ -566,7 +566,7 @@ export function createJsNavigationDestructiveHandlers(deps = {}) {
       }
 
       const url = params.url == null || params.url === ''
-        ? 'https://example.com/'
+        ? 'about:blank'
         : ensureUrl(params.url);
       const createProperties = {
         url,
