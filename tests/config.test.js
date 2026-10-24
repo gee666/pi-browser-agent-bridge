@@ -44,14 +44,21 @@ test('normalizePiBridgeConfig auto-migrates a legacy single-URL default to the f
   assert.ok(out.urls.includes('ws://127.0.0.1:7879'));
 });
 
-test('normalizePiBridgeConfig auto-migrates a saved single-entry urls default to the full range', () => {
-  // A user may have opened/saved the options page after the textarea change,
-  // leaving chrome.storage with `urls: ["ws://127.0.0.1:7878"]`. That should
-  // also expand; otherwise only the first pi instance can connect.
-  const out = normalizePiBridgeConfig({ enabled: true, urls: [' ws://127.0.0.1:7878 '] });
-  assert.ok(out.urls.length >= 2, `expected migrated range, got ${JSON.stringify(out.urls)}`);
-  assert.equal(out.urls[0], 'ws://127.0.0.1:7878');
-  assert.ok(out.urls.includes('ws://127.0.0.1:7879'));
+test('normalizePiBridgeConfig preserves an explicit single-port list through repeated normalization', () => {
+  for (const urls of [[' ws://127.0.0.1:7878 '], ' ws://127.0.0.1:7878 ']) {
+    const expected = { enabled: true, url: 'ws://127.0.0.1:7878', urls: ['ws://127.0.0.1:7878'] };
+    const out = normalizePiBridgeConfig({ enabled: true, urls });
+    assert.deepEqual(out, expected);
+    // Stored configs include the legacy `url` alias too; it must not override
+    // the explicit list when read back by the options page or bridge runtime.
+    assert.deepEqual(normalizePiBridgeConfig(out), expected);
+  }
+});
+
+test('readPiBridgeConfig preserves an explicitly saved single-port configuration', async () => {
+  const saved = { enabled: true, url: 'ws://127.0.0.1:7878', urls: ['ws://127.0.0.1:7878'] };
+  const storageArea = { get(_keys, callback) { callback({ piBridgeConfig: saved }); } };
+  assert.deepEqual(await readPiBridgeConfig(storageArea), saved);
 });
 
 test('normalizePiBridgeConfig keeps a custom legacy url as a single entry (no migration)', () => {
