@@ -190,63 +190,142 @@ test('handler family exports the expected request names', () => {
   ]);
 });
 
-test('evaluate_js and run_js execute through the inspector and release leases', async () => {
+test('all external JS, including reads and aliases, passes unchanged through the rewrite service', async () => {
   const { tabsApi } = createTabApis();
   const inspector = createInspector();
-  const handlers = createJsNavigationDestructiveHandlers({ tabsApi, inspector, resolveDefaultTabId: async () => 11 });
+  const requests = [];
+  const handlers = createJsNavigationDestructiveHandlers({
+    tabsApi, inspector, resolveDefaultTabId: async () => 11,
+    async executeExternalScript(request) {
+      requests.push(request);
+      return { type: 'number', value: 2, console_entries: [{ level: 'log', entries: ['hello'] }] };
+    },
+  });
 
-  const evaluate = await handlers.browser_evaluate_js({ expression: '1 + 1' });
-  assert.equal(evaluate.tabId, 11);
-  assert.equal(evaluate.value, 2);
-  assert.deepEqual(inspector.calls[0], ['acquire', 11]);
-  assert.equal(inspector.calls.at(-1)[0], 'release');
+  for (const expression of ['1 + 1', 'document.title', 'const el = document.querySelector("button"); el["click"]()']) {
+    const result = await handlers.browser_evaluate_js({ expression, world: 'main' });
+    assert.equal(result.tabId, 11);
+    assert.equal(result.url, 'https://example.com/start');
+    assert.equal(result.value, 2);
+    assert.equal(result.console_entries, undefined);
+    assert.equal(typeof result.duration_ms, 'number');
+    const { signal, ...request } = requests.at(-1);
+    assert.equal(signal.aborted, false);
+    assert.deepEqual(request, {
+      tabId: 11, kind: 'expression', source: expression, args: [],
+      awaitPromise: true, returnByValue: true, captureConsole: false, timeoutMs: 15_000,
+    });
+  }
 
-  const run = await handlers.browser_run_js({ code: 'return "done";' });
-  assert.equal(run.tabId, 11);
+  const code = 'console.log(args[0]); return args[0];';
+  const run = await handlers.browser_run_js({ code, args: ['done'], tab_id: 12, timeout_ms: 500 });
+  assert.equal(run.tabId, 12);
   assert.equal(run.console_entries.length, 1);
+  const { signal, ...request } = requests.at(-1);
+  assert.deepEqual(request, {
+    tabId: 12, kind: 'program', source: code, args: ['done'],
+    awaitPromise: true, returnByValue: true, captureConsole: true, timeoutMs: 500,
+  });
+  assert.equal(signal.aborted, false);
+  assert.deepEqual(inspector.calls, [], 'external source must never execute directly through CDP');
 });
 
-test('evaluate_js preserves unserializable CDP values returned by runtime evaluation', async () => {
+test('the rewrite service preserves non-JSON numbers and preview semantics', async () => {
   const { tabsApi } = createTabApis();
-  const inspector = createInspector();
-  inspector.sendCommand = async (tabId, method, params) => {
-    inspector.calls.push(['sendCommand', tabId, method, params]);
-    if (method === 'Runtime.evaluate') {
-      return {
-        result: {
-          type: 'number',
-          unserializableValue: 'NaN',
-        },
-      };
-    }
-    return {};
-  };
-  const handlers = createJsNavigationDestructiveHandlers({ tabsApi, inspector, resolveDefaultTabId: async () => 11 });
-
+  const requests = [];
+  const handlers = createJsNavigationDestructiveHandlers({
+    tabsApi, resolveDefaultTabId: async () => 11,
+    async executeExternalScript(request) {
+      requests.push(request);
+      return { type: 'number', value: Number.NaN, preview: { description: 'number' } };
+    },
+  });
   const result = await handlers.browser_evaluate_js({ expression: 'Number.NaN' });
   assert.equal(Number.isNaN(result.value), true);
+  const preview = await handlers.browser_evaluate_js({ expression: 'Number.NaN', return_by_value: false, await_promise: false });
+  assert.equal(preview.value, undefined);
+  assert.deepEqual(preview.preview, { description: 'number' });
+  assert.equal(requests.at(-1).returnByValue, false);
+  assert.equal(requests.at(-1).awaitPromise, false);
+
+  const run = await handlers.browser_run_js({ code: 'return 1;', capture_console: false, return_by_value: false });
+  assert.equal(run.console_entries, undefined);
+  assert.equal(requests.at(-1).captureConsole, false);
 });
 
-test('evaluate_js timeout performs best-effort cleanup and surfaces a structured error', async () => {
+test('missing, rejecting, or malformed rewrite services fail closed without CDP execution', async () => {
   const { tabsApi } = createTabApis();
   const inspector = createInspector();
-  inspector.sendCommand = async (tabId, method) => {
-    inspector.calls.push(['sendCommand', tabId, method]);
-    if (method === 'Runtime.evaluate' || method === 'Runtime.releaseObjectGroup') {
-      return await new Promise(() => {});
-    }
-    return {};
-  };
-  const handlers = createJsNavigationDestructiveHandlers({ tabsApi, inspector, resolveDefaultTabId: async () => 11 });
+  for (const [executeExternalScript, code] of [
+    [undefined, 'E_SCRIPT_REWRITE_UNAVAILABLE'],
+    [async () => { throw Object.assign(new Error('unsupported script'), { code: 'E_SCRIPT_UNSUPPORTED' }); }, 'E_SCRIPT_UNSUPPORTED'],
+    [async () => undefined, 'E_SCRIPT_REWRITE_RESPONSE'],
+  ]) {
+    const handlers = createJsNavigationDestructiveHandlers({ tabsApi, inspector, executeExternalScript, resolveDefaultTabId: async () => 11 });
+    await assert.rejects(handlers.browser_evaluate_js({ expression: 'document.title' }), { code });
+    await assert.rejects(handlers.browser_run_js({ code: 'document.querySelector("button").click();' }), { code });
+  }
+  assert.deepEqual(inspector.calls, []);
+});
+
+test('run_js preserves legacy console entries from normalized service logs', async () => {
+  const { tabsApi } = createTabApis();
+  const handlers = createJsNavigationDestructiveHandlers({
+    tabsApi, resolveDefaultTabId: async () => 11,
+    async executeExternalScript() {
+      return { type: 'undefined', value: undefined, console_entries: [
+        { level: 'log', args: ['core log'] },
+        { level: 'warn', entries: ['legacy log'] },
+      ] };
+    },
+  });
+  const run = await handlers.browser_run_js({ code: 'console.log("core log");' });
+  assert.deepEqual(run.console_entries, [
+    { level: 'log', entries: ['core log'] },
+    { level: 'warn', entries: ['legacy log'] },
+  ]);
+});
+
+test('evaluate_js timeout synchronously aborts the rewrite service and surfaces a structured error', async () => {
+  const { tabsApi } = createTabApis();
+  const inspector = createInspector();
+  let signal;
+  const handlers = createJsNavigationDestructiveHandlers({
+    tabsApi, inspector, resolveDefaultTabId: async () => 11,
+    executeExternalScript(request) {
+      signal = request.signal;
+      return new Promise(() => {});
+    },
+  });
 
   await assert.rejects(
     handlers.browser_evaluate_js({ expression: '1 + 1', timeout_ms: 10 }),
     (error) => {
       assert.equal(error.code, 'E_TIMEOUT');
       assert.match(error.message, /evaluating JavaScript/);
+      assert.equal(signal.aborted, true);
+      assert.equal(signal.reason, error);
       return true;
     },
   );
+  assert.deepEqual(inspector.calls, []);
+});
+
+test('invalid JS options never invoke the rewrite service', async () => {
+  const { tabsApi } = createTabApis();
+  const handlers = createJsNavigationDestructiveHandlers({
+    tabsApi,
+    executeExternalScript() { assert.fail('invalid requests must not run'); },
+  });
+  for (const args of [null, {}, 'text', 1, true]) {
+    await assert.rejects(handlers.browser_run_js({ code: 'return args;', args }), { code: 'E_VALIDATION' });
+  }
+  for (const timeout_ms of [0, -1, Infinity, '10', Number.NaN]) {
+    await assert.rejects(handlers.browser_evaluate_js({ expression: '1', timeout_ms }), { code: 'E_VALIDATION' });
+    await assert.rejects(handlers.browser_run_js({ code: 'return 1;', timeout_ms }), { code: 'E_VALIDATION' });
+  }
+  await assert.rejects(handlers.browser_evaluate_js({ expression: '1', world: 'isolated' }), { code: 'E_VALIDATION' });
+  await assert.rejects(handlers.browser_run_js({ code: 'return 1;', world: 'isolated' }), { code: 'E_VALIDATION' });
 });
 
 test('navigation family handlers perform tab operations without crashing the caller', async () => {

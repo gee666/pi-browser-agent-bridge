@@ -1,4 +1,3 @@
-const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000;
 const DEFAULT_EVALUATE_TIMEOUT_MS = 15_000;
 const DEFAULT_RUN_JS_TIMEOUT_MS = 30_000;
@@ -329,190 +328,66 @@ async function waitForNavigationAfterAction(tabId, deps, action, waitUntil = 'lo
   });
 }
 
-async function withInspectorLease(inspector, tabId, callback) {
-  if (!inspector || typeof inspector.acquire !== 'function' || typeof inspector.release !== 'function') {
-    throw createProtocolError('E_INTERNAL', 'A CDP inspector is required for this operation');
+/**
+ * External source must never reach Runtime.evaluate directly. The injected
+ * service rewrites it into a validated plan and executes native input only.
+ * Internal inspection handlers use their own fixed, trusted scripts.
+ */
+async function executeExternalScript(params, deps, options) {
+  if (typeof deps.executeExternalScript !== 'function') {
+    throw createProtocolError('E_SCRIPT_REWRITE_UNAVAILABLE', 'The native script rewrite service is not configured');
   }
-
-  const lease = await inspector.acquire(tabId).catch((error) => {
-    throw createProtocolError('E_CDP_ATTACH', `Failed to attach debugger to tab ${tabId}`, normalizeError(error));
-  });
-
-  try {
-    return await callback(lease);
-  } finally {
-    try {
-      await inspector.release(lease);
-    } catch {
-      // Never let cleanup crash the parent runtime.
-    }
+  const timeoutMs = options.timeoutMs;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw createProtocolError('E_VALIDATION', 'timeout_ms must be a positive finite number');
   }
-}
-
-async function cleanupJsEvaluation(inspector, tabId, objectGroup) {
-  try {
-    await inspector.sendCommand(tabId, 'Runtime.releaseObjectGroup', { objectGroup }, { requireLease: false });
-  } catch {
-    // Best-effort cleanup only.
-  }
-}
-
-function buildRuntimeExpression({ expression, code, args = [], captureConsole = false }) {
-  if (typeof expression === 'string') {
-    return expression;
-  }
-
-  const serializedArgs = JSON.stringify(Array.isArray(args) ? args : []);
-  const consolePrelude = captureConsole
-    ? `
-      const __piConsole = [];
-      const __piOriginalConsole = {};
-      for (const level of ['log','info','warn','error','debug']) {
-        __piOriginalConsole[level] = console[level];
-        console[level] = (...entries) => {
-          __piConsole.push({ level, entries });
-          return __piOriginalConsole[level].apply(console, entries);
-        };
-      }
-    `
-    : 'const __piConsole = [];';
-
-  const consoleRestore = captureConsole
-    ? `
-      for (const level of ['log','info','warn','error','debug']) {
-        console[level] = __piOriginalConsole[level];
-      }
-    `
-    : '';
-
-  return `
-    (async () => {
-      ${consolePrelude}
-      try {
-        const __piRunner = async (...args) => {
-          ${code || ''}
-        };
-        const __piValue = await __piRunner(...${serializedArgs});
-        return { __piValue, __piConsole };
-      } finally {
-        ${consoleRestore}
-      }
-    })()
-  `;
-}
-
-function normalizeRuntimeValue(result) {
-  if (result && typeof result === 'object' && 'unserializableValue' in result && typeof result.unserializableValue === 'string') {
-    switch (result.unserializableValue) {
-      case 'NaN':
-        return Number.NaN;
-      case 'Infinity':
-        return Number.POSITIVE_INFINITY;
-      case '-Infinity':
-        return Number.NEGATIVE_INFINITY;
-      case '-0':
-        return -0;
-      default:
-        return result.unserializableValue;
-    }
-  }
-
-  return result?.value;
-}
-
-function normalizeRuntimeResult(result, { returnByValue = true, captureConsole = false, startedAt }) {
-  const response = {
-    type: result?.result?.type,
-    subtype: result?.result?.subtype,
-    value: undefined,
-    preview: undefined,
-    exception: undefined,
-    console_entries: undefined,
-    duration_ms: Date.now() - startedAt,
-  };
-
-  if (result?.exceptionDetails) {
-    response.exception = {
-      text: result.exceptionDetails.text,
-      lineNumber: result.exceptionDetails.lineNumber,
-      columnNumber: result.exceptionDetails.columnNumber,
-      exception: result.exceptionDetails.exception,
-    };
-    return response;
-  }
-
-  const runtimeValue = normalizeRuntimeValue(result?.result);
-  if (captureConsole && runtimeValue && typeof runtimeValue === 'object' && '__piValue' in runtimeValue) {
-    response.value = runtimeValue.__piValue;
-    response.console_entries = Array.isArray(runtimeValue.__piConsole) ? runtimeValue.__piConsole : [];
-    return response;
-  }
-
-  if (returnByValue) {
-    response.value = runtimeValue;
-  } else {
-    response.preview = result?.result?.preview || {
-      description: result?.result?.description,
-      className: result?.result?.className,
-      objectId: result?.result?.objectId,
-    };
-  }
-
-  return response;
-}
-
-async function evaluateRuntime(params, deps, options) {
   const tab = await resolveTargetTab(params, deps);
-  const tabId = tab.id;
-  const inspector = deps.inspector;
-  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : DEFAULT_TIMEOUT_MS;
-  const objectGroup = `pi-browser-agent-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const startedAt = Date.now();
-
-  return await withInspectorLease(inspector, tabId, async () => {
-    try {
-      await inspector.sendCommand(tabId, 'Runtime.enable', {}, { requireLease: true });
-    } catch {
-      // Runtime.enable is best-effort for tests/mocks.
-    }
-
-    const evaluateParams = {
-      expression: options.expression,
-      awaitPromise: options.awaitPromise,
-      returnByValue: options.returnByValue,
-      includeCommandLineAPI: true,
-      userGesture: false,
-      objectGroup,
-    };
-
-    const result = await withTimeout(
-      () => inspector.sendCommand(tabId, 'Runtime.evaluate', evaluateParams, { requireLease: true }),
-      {
-        timeoutMs,
-        timeoutMessage: withTimeoutLabel('evaluating JavaScript', tabId),
-        onTimeout: async () => {
-          await cleanupJsEvaluation(inspector, tabId, objectGroup);
-        },
-      },
-    );
-
-    const normalized = normalizeRuntimeResult(result, {
-      returnByValue: options.returnByValue,
-      captureConsole: options.captureConsole,
-      startedAt,
+  const controller = new AbortController();
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = createProtocolError('E_TIMEOUT', withTimeoutLabel('evaluating JavaScript', tab.id), { timeoutMs });
+        // Abort synchronously, before the caller can issue another request.
+        controller.abort(error);
+        reject(error);
+      }, timeoutMs);
     });
-
-    if (normalized.exception) {
-      throw createProtocolError('E_INTERNAL', normalized.exception.text || 'JavaScript execution failed', normalized);
+    const result = await Promise.race([
+      Promise.resolve().then(() => deps.executeExternalScript({
+        tabId: tab.id,
+        kind: options.kind,
+        source: options.source,
+        args: options.args || [],
+        awaitPromise: options.awaitPromise,
+        returnByValue: options.returnByValue,
+        captureConsole: options.captureConsole,
+        timeoutMs,
+        signal: controller.signal,
+      })),
+      timeout,
+    ]);
+    if (!result || typeof result !== 'object' || typeof result.type !== 'string') {
+      throw createProtocolError('E_SCRIPT_REWRITE_RESPONSE', 'The native script rewrite service returned an invalid result');
     }
-
     return {
-      tabId,
+      tabId: tab.id,
       url: tab.url,
       title: tab.title,
-      ...normalized,
+      type: result.type,
+      subtype: result.subtype,
+      value: options.returnByValue ? result.value : undefined,
+      preview: options.returnByValue ? undefined : result.preview,
+      exception: undefined,
+      console_entries: options.captureConsole
+        ? (result.console_entries || []).map(({ level, entries, args }) => ({ level, entries: entries ?? args ?? [] }))
+        : undefined,
+      duration_ms: Date.now() - startedAt,
     };
-  });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function createJsNavigationDestructiveHandlers(deps = {}) {
@@ -525,12 +400,12 @@ export function createJsNavigationDestructiveHandlers(deps = {}) {
         throw createProtocolError('E_VALIDATION', 'Only world="main" is currently supported');
       }
 
-      return await evaluateRuntime(params, deps, {
-        expression: params.expression,
+      return await executeExternalScript(params, deps, {
+        kind: 'expression',
+        source: params.expression,
         awaitPromise: params.await_promise !== false,
         returnByValue: params.return_by_value !== false,
         timeoutMs: params.timeout_ms ?? DEFAULT_EVALUATE_TIMEOUT_MS,
-        world: params.world || 'main',
         captureConsole: false,
       });
     },
@@ -545,17 +420,17 @@ export function createJsNavigationDestructiveHandlers(deps = {}) {
       if (params.capture_console !== false && params.return_by_value === false) {
         throw createProtocolError('E_VALIDATION', 'capture_console requires return_by_value=true');
       }
+      if (params.args !== undefined && !Array.isArray(params.args)) {
+        throw createProtocolError('E_VALIDATION', 'args must be an array');
+      }
 
-      return await evaluateRuntime(params, deps, {
-        expression: buildRuntimeExpression({
-          code: params.code,
-          args: params.args,
-          captureConsole: params.capture_console !== false,
-        }),
+      return await executeExternalScript(params, deps, {
+        kind: 'program',
+        source: params.code,
+        args: params.args ?? [],
         awaitPromise: true,
         returnByValue: params.return_by_value !== false,
         timeoutMs: params.timeout_ms ?? DEFAULT_RUN_JS_TIMEOUT_MS,
-        world: params.world || 'main',
         captureConsole: params.capture_console !== false,
       });
     },

@@ -28,6 +28,32 @@ Default config:
 - enabled: `true`
 - url: `ws://127.0.0.1:7878`
 
+## External scripts
+
+`createJsNavigationDestructiveHandlers` requires an injected `executeExternalScript` service for `browser_evaluate_js` and `browser_run_js`. Every supplied script goes through this service, including read-only expressions. Missing services and rejected scripts produce structured errors. The bridge never falls back to `Runtime.evaluate`.
+
+The callback accepts:
+
+```js
+{
+  tabId,
+  kind: 'expression', // or 'program' for run_js
+  source,
+  args: [],
+  awaitPromise: true,
+  returnByValue: true,
+  captureConsole: false,
+  timeoutMs: 15000,
+  signal,
+}
+```
+
+It returns `{type, value, subtype?, preview?, console_entries?}`. Console entries use `{level, entries}`; the bridge also accepts the core service's `{level, args}` format and converts it. The bridge adds tab metadata and elapsed time.
+
+The extension injects `browser-agent-core`'s `NativeScriptService` with its configured AI provider and a dedicated Python `InputControlBridge`. The service translates source into a bounded, deterministically validated plan. It supports a subset of script semantics, not arbitrary JavaScript execution. Unsupported operations or options must reject explicitly. `world: 'main'` remains accepted for tool compatibility but does not grant direct page-world execution. Trusted built-in inspection scripts do not pass through translation.
+
+A request deadline aborts the service's signal so pending native input can stop. The current RPC protocol has no cancellation frame; cancelling a tool call at the client does not itself stop extension work before its deadline. The extension must prevent concurrent script and task desktop input, including during provider setup and translation.
+
 ## Development
 
 Run the bridge unit tests from this folder:
