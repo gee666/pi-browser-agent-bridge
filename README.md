@@ -43,7 +43,7 @@ The callback accepts:
   awaitPromise: true,
   returnByValue: true,
   captureConsole: false,
-  timeoutMs: 15000,
+  timeoutMs: 120000,
   signal,
 }
 ```
@@ -52,7 +52,7 @@ It returns `{type, value, subtype?, preview?, console_entries?}`. Console entrie
 
 The extension injects `browser-agent-core`'s `NativeScriptService` with its configured AI provider and a dedicated Python `InputControlBridge`. The service translates source into a bounded, deterministically validated plan. It supports a subset of script semantics, not arbitrary JavaScript execution. Unsupported operations or options must reject explicitly. `world: 'main'` remains accepted for tool compatibility but does not grant direct page-world execution. Trusted built-in inspection scripts do not pass through translation.
 
-A request deadline aborts the service's signal so pending native input can stop. The current RPC protocol has no cancellation frame; cancelling a tool call at the client does not itself stop extension work before its deadline. The extension must prevent concurrent script and task desktop input, including during provider setup and translation.
+Both external script tools default to a 120-second deadline for AI translation and native execution. Navigation deadlines are unchanged. A request deadline aborts the service's signal so pending native input can stop. The current RPC protocol has no cancellation frame; cancelling a tool call at the client does not itself stop extension work before its deadline. The extension must prevent concurrent script and task desktop input, including during provider setup and translation.
 
 ## Development
 

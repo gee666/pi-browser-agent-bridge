@@ -213,7 +213,7 @@ test('all external JS, including reads and aliases, passes unchanged through the
     assert.equal(signal.aborted, false);
     assert.deepEqual(request, {
       tabId: 11, kind: 'expression', source: expression, args: [],
-      awaitPromise: true, returnByValue: true, captureConsole: false, timeoutMs: 15_000,
+      awaitPromise: true, returnByValue: true, captureConsole: false, timeoutMs: 120_000,
     });
   }
 
@@ -251,6 +251,7 @@ test('the rewrite service preserves non-JSON numbers and preview semantics', asy
   const run = await handlers.browser_run_js({ code: 'return 1;', capture_console: false, return_by_value: false });
   assert.equal(run.console_entries, undefined);
   assert.equal(requests.at(-1).captureConsole, false);
+  assert.equal(requests.at(-1).timeoutMs, 120_000);
 });
 
 test('missing, rejecting, or malformed rewrite services fail closed without CDP execution', async () => {
