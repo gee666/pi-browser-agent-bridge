@@ -1,5 +1,4 @@
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 30_000;
-const DEFAULT_EVALUATE_TIMEOUT_MS = 120_000;
 const DEFAULT_RUN_JS_TIMEOUT_MS = 120_000;
 const DEFAULT_SETTLE_QUIET_MS = 500;
 
@@ -357,10 +356,10 @@ async function executeExternalScript(params, deps, options) {
     const result = await Promise.race([
       Promise.resolve().then(() => deps.executeExternalScript({
         tabId: tab.id,
-        kind: options.kind,
+        kind: 'program',
         source: options.source,
         args: options.args || [],
-        awaitPromise: options.awaitPromise,
+        awaitPromise: true,
         returnByValue: options.returnByValue,
         captureConsole: options.captureConsole,
         timeoutMs,
@@ -392,24 +391,6 @@ async function executeExternalScript(params, deps, options) {
 
 export function createJsNavigationDestructiveHandlers(deps = {}) {
   const handlers = {
-    async browser_evaluate_js(params = {}) {
-      if (typeof params.expression !== 'string' || !params.expression.trim()) {
-        throw createProtocolError('E_VALIDATION', 'expression is required');
-      }
-      if (params.world && params.world !== 'main') {
-        throw createProtocolError('E_VALIDATION', 'Only world="main" is currently supported');
-      }
-
-      return await executeExternalScript(params, deps, {
-        kind: 'expression',
-        source: params.expression,
-        awaitPromise: params.await_promise !== false,
-        returnByValue: params.return_by_value !== false,
-        timeoutMs: params.timeout_ms ?? DEFAULT_EVALUATE_TIMEOUT_MS,
-        captureConsole: false,
-      });
-    },
-
     async browser_run_js(params = {}) {
       if (typeof params.code !== 'string' || !params.code.trim()) {
         throw createProtocolError('E_VALIDATION', 'code is required');
@@ -425,10 +406,8 @@ export function createJsNavigationDestructiveHandlers(deps = {}) {
       }
 
       return await executeExternalScript(params, deps, {
-        kind: 'program',
         source: params.code,
         args: params.args ?? [],
-        awaitPromise: true,
         returnByValue: params.return_by_value !== false,
         timeoutMs: params.timeout_ms ?? DEFAULT_RUN_JS_TIMEOUT_MS,
         captureConsole: params.capture_console !== false,
@@ -656,7 +635,6 @@ export function createJsNavigationDestructiveRequestHandler(deps = {}) {
 }
 
 export const JS_NAVIGATION_DESTRUCTIVE_HANDLER_NAMES = Object.freeze([
-  'browser_evaluate_js',
   'browser_run_js',
   'browser_create_tab',
   'browser_navigate',

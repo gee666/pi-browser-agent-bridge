@@ -30,7 +30,7 @@ Default config:
 
 ## External scripts
 
-`createJsNavigationDestructiveHandlers` requires an injected `executeExternalScript` service for `browser_evaluate_js` and `browser_run_js`. Every supplied script goes through this service, including read-only expressions. Missing services and rejected scripts produce structured errors. The bridge never falls back to `Runtime.evaluate`.
+`createJsNavigationDestructiveHandlers` requires an injected `executeExternalScript` service for `browser_run_js`. Every supplied script goes through this service, including scripts that only read a value. Missing services and rejected scripts produce structured errors. The bridge never falls back to `Runtime.evaluate`.
 
 The callback accepts:
 

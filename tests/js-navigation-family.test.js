@@ -179,7 +179,6 @@ function createInspector() {
 
 test('handler family exports the expected request names', () => {
   assert.deepEqual(JS_NAVIGATION_DESTRUCTIVE_HANDLER_NAMES, [
-    'browser_evaluate_js',
     'browser_run_js',
     'browser_create_tab',
     'browser_navigate',
@@ -202,8 +201,8 @@ test('all external JS, including reads and aliases, passes unchanged through the
     },
   });
 
-  for (const expression of ['1 + 1', 'document.title', 'const el = document.querySelector("button"); el["click"]()']) {
-    const result = await handlers.browser_evaluate_js({ expression, world: 'main' });
+  for (const code of ['return 1 + 1;', 'return document.title;', 'const el = document.querySelector("button"); el["click"]()']) {
+    const result = await handlers.browser_run_js({ code, world: 'main', capture_console: false });
     assert.equal(result.tabId, 11);
     assert.equal(result.url, 'https://example.com/start');
     assert.equal(result.value, 2);
@@ -212,7 +211,7 @@ test('all external JS, including reads and aliases, passes unchanged through the
     const { signal, ...request } = requests.at(-1);
     assert.equal(signal.aborted, false);
     assert.deepEqual(request, {
-      tabId: 11, kind: 'expression', source: expression, args: [],
+      tabId: 11, kind: 'program', source: code, args: [],
       awaitPromise: true, returnByValue: true, captureConsole: false, timeoutMs: 120_000,
     });
   }
@@ -240,13 +239,13 @@ test('the rewrite service preserves non-JSON numbers and preview semantics', asy
       return { type: 'number', value: Number.NaN, preview: { description: 'number' } };
     },
   });
-  const result = await handlers.browser_evaluate_js({ expression: 'Number.NaN' });
+  const result = await handlers.browser_run_js({ code: 'return Number.NaN;' });
   assert.equal(Number.isNaN(result.value), true);
-  const preview = await handlers.browser_evaluate_js({ expression: 'Number.NaN', return_by_value: false, await_promise: false });
+  const preview = await handlers.browser_run_js({ code: 'return Number.NaN;', return_by_value: false, capture_console: false });
   assert.equal(preview.value, undefined);
   assert.deepEqual(preview.preview, { description: 'number' });
   assert.equal(requests.at(-1).returnByValue, false);
-  assert.equal(requests.at(-1).awaitPromise, false);
+  assert.equal(requests.at(-1).awaitPromise, true);
 
   const run = await handlers.browser_run_js({ code: 'return 1;', capture_console: false, return_by_value: false });
   assert.equal(run.console_entries, undefined);
@@ -263,7 +262,6 @@ test('missing, rejecting, or malformed rewrite services fail closed without CDP 
     [async () => undefined, 'E_SCRIPT_REWRITE_RESPONSE'],
   ]) {
     const handlers = createJsNavigationDestructiveHandlers({ tabsApi, inspector, executeExternalScript, resolveDefaultTabId: async () => 11 });
-    await assert.rejects(handlers.browser_evaluate_js({ expression: 'document.title' }), { code });
     await assert.rejects(handlers.browser_run_js({ code: 'document.querySelector("button").click();' }), { code });
   }
   assert.deepEqual(inspector.calls, []);
@@ -287,7 +285,7 @@ test('run_js preserves legacy console entries from normalized service logs', asy
   ]);
 });
 
-test('evaluate_js timeout synchronously aborts the rewrite service and surfaces a structured error', async () => {
+test('run_js timeout synchronously aborts the rewrite service and surfaces a structured error', async () => {
   const { tabsApi } = createTabApis();
   const inspector = createInspector();
   let signal;
@@ -300,7 +298,7 @@ test('evaluate_js timeout synchronously aborts the rewrite service and surfaces 
   });
 
   await assert.rejects(
-    handlers.browser_evaluate_js({ expression: '1 + 1', timeout_ms: 10 }),
+    handlers.browser_run_js({ code: 'return 1 + 1;', timeout_ms: 10 }),
     (error) => {
       assert.equal(error.code, 'E_TIMEOUT');
       assert.match(error.message, /evaluating JavaScript/);
@@ -322,10 +320,8 @@ test('invalid JS options never invoke the rewrite service', async () => {
     await assert.rejects(handlers.browser_run_js({ code: 'return args;', args }), { code: 'E_VALIDATION' });
   }
   for (const timeout_ms of [0, -1, Infinity, '10', Number.NaN]) {
-    await assert.rejects(handlers.browser_evaluate_js({ expression: '1', timeout_ms }), { code: 'E_VALIDATION' });
     await assert.rejects(handlers.browser_run_js({ code: 'return 1;', timeout_ms }), { code: 'E_VALIDATION' });
   }
-  await assert.rejects(handlers.browser_evaluate_js({ expression: '1', world: 'isolated' }), { code: 'E_VALIDATION' });
   await assert.rejects(handlers.browser_run_js({ code: 'return 1;', world: 'isolated' }), { code: 'E_VALIDATION' });
 });
 
