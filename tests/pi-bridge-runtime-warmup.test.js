@@ -74,7 +74,7 @@ function stubInspector(runtime, armed) {
   runtime.inspector.isAttached = () => true;
 }
 
-test('warmUp arms existing tabs so service-worker restart resumes CDP subscriptions', async () => {
+test('warmUp does not attach the debugger to existing tabs', async () => {
   const storageArea = createStorageArea();
   const chromeApi = createChromeApi([
     { id: 101, url: 'https://a.test', active: true },
@@ -91,15 +91,17 @@ test('warmUp arms existing tabs so service-worker restart resumes CDP subscripti
 
   await runtime.warmUp();
 
-  assert.ok(armed.includes(101), 'existing tab 101 should be armed on warmUp');
-  assert.ok(armed.includes(102), 'existing tab 102 should be armed on warmUp');
+  assert.deepEqual(armed, []);
 
   await runtime.dispose();
 });
 
-test('setEnabled(true) after a restart also arms existing tabs', async () => {
+test('enabling the bridge does not arm tabs; an explicit logs request arms only its target', async () => {
   const storageArea = createStorageArea();
-  const chromeApi = createChromeApi([{ id: 201, url: 'https://c.test', active: true }]);
+  const chromeApi = createChromeApi([
+    { id: 201, url: 'https://c.test', active: true },
+    { id: 202, url: 'https://d.test', active: false },
+  ]);
   const runtime = createPiBridgeRuntime({
     chromeApi,
     logger: { warn() {}, error() {}, info() {} },
@@ -110,9 +112,9 @@ test('setEnabled(true) after a restart also arms existing tabs', async () => {
   stubInspector(runtime, armed);
 
   await runtime.setEnabled(true);
-  // Both console and network buffer managers each acquire for the tab.
-  assert.ok(armed.includes(201), 'setEnabled should arm existing tab 201');
-  assert.ok(armed.length >= 1, 'arming should occur at least once via armExistingTabs');
+  assert.deepEqual(armed, []);
+  await runtime.handleRequest({ type: 'browser_get_console_logs', params: { tab_id: 202 } });
+  assert.deepEqual([...new Set(armed)], [202]);
 
   await runtime.dispose();
 });
